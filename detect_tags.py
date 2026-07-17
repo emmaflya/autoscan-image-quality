@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Camera parameters (OpenCV)
+# Camera parameters for Xacti 4000x3000 (OpenCV)
 IMG_W, IMG_H = 4000, 3000
 K = np.array([
     [1741.5801,    0.0, 1994.2998],
@@ -291,7 +291,28 @@ dictionary = cv2.aruco.getPredefinedDictionary(
 
 parameters = cv2.aruco.DetectorParameters()
 
+# Tune for small markers (e.g. at 1m distance tags can be ~70-90px).
+# Lower the minimum perimeter threshold so small tags aren't rejected.
+parameters.minMarkerPerimeterRate = 0.01  # default 0.03; allow smaller markers
+parameters.maxMarkerPerimeterRate = 4.0
+
+# Use finer adaptive threshold window steps for better small-marker binarization.
+parameters.adaptiveThreshWinSizeMin = 3
+parameters.adaptiveThreshWinSizeMax = 53   # default 23; larger range helps varied sizes
+parameters.adaptiveThreshWinSizeStep = 4   # default 10; finer steps improve detection
+
+# Be more lenient on corner refinement for small tags.
+parameters.polygonalApproxAccuracyRate = 0.05  # default 0.03; more tolerant
+parameters.minCornerDistanceRate = 0.01        # default 0.05; allow closer corners
+
+# Improve bit extraction for small markers.
+parameters.perspectiveRemovePixelPerCell = 8   # default 4; more pixels per cell
+parameters.perspectiveRemoveIgnoredMarginPerCell = 0.2  # default 0.13
+
 detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+
+# Scale factor for multi-scale detection fallback when tags are too small.
+UPSCALE_FACTOR = 2
 
 
 def order_points(pts):
@@ -376,7 +397,7 @@ def undistort_and_crop(img_full, tag_centers_full, tag_corners_full):
     # Tag side length in output (warped/cropped) pixels
     tag_side_output_px = avg_tag_side_px * output_scale
 
-    return cropped, tag_side_output_px, margin_px
+    return cropped, tag_side_output_px, margin_px, M, new_K
 
 
 def resize_keep_aspect(img, max_size=1600):
@@ -409,6 +430,22 @@ def process_image(filename, output_dir, crops_dir, all_scores):
     # Detect tags at full resolution for precision
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     corners, ids, rejected = detector.detectMarkers(gray)
+
+    # Multi-scale fallback: if few tags detected, retry on upscaled image.
+    # At larger distances (e.g. 1m) tags may be too small for reliable detection.
+    if ids is None or len(ids) < 4:
+        h_up, w_up = gray.shape
+        upscaled = cv2.resize(
+            gray,
+            (w_up * UPSCALE_FACTOR, h_up * UPSCALE_FACTOR),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        corners_up, ids_up, _ = detector.detectMarkers(upscaled)
+        if ids_up is not None and (ids is None or len(ids_up) > len(ids)):
+            # Scale corners back to original resolution
+            corners = [c / UPSCALE_FACTOR for c in corners_up]
+            ids = ids_up
+            print(f"  (used {UPSCALE_FACTOR}x upscale for detection)")
 
     # Full-resolution image center and circle check
     h_full, w_full = img.shape[:2]
@@ -489,10 +526,50 @@ def process_image(filename, output_dir, crops_dir, all_scores):
                 for tid in target_tag_ids
             ], dtype=np.float32)
 
-            cropped, tag_side_output_px, margin_px = undistort_and_crop(img, tag_centers, tag_corners_full)
+            cropped, tag_side_output_px, margin_px, M_warp, new_K = undistort_and_crop(img, tag_centers, tag_corners_full)
 
             # Score each USAF frequency element
             freq_scores = score_usaf(cropped)
+
+            # Compute position of each frequency row in original (distorted) image space
+            ch, cw = cropped.shape[:2] if len(cropped.shape) == 2 else cropped.shape[:2]
+            num_rows_pos = len(FREQUENCY_LABELS)
+            row_h_pos = ch // num_rows_pos
+            M_inv = np.linalg.inv(M_warp)
+            for row_idx, entry in enumerate(freq_scores):
+                # Center of frequency row in cropped space
+                cx_crop = cw / 2.0
+                cy_crop = row_idx * row_h_pos + row_h_pos / 2.0
+                # Map to warped-square space (add margin back)
+                cx_warp = cx_crop + margin_px
+                cy_warp = cy_crop + margin_px
+                # Inverse perspective to get undistorted full-res coords
+                pt_warp = np.array([[[cx_warp, cy_warp]]], dtype=np.float64)
+                pt_undist = cv2.perspectiveTransform(pt_warp, M_inv)[0][0]
+                # Re-distort: map from undistorted (new_K) back to original distorted coords
+                # Normalize by new_K to get normalized coords, then apply distortion, then project with K
+                fx_new, fy_new = new_K[0, 0], new_K[1, 1]
+                cx_new, cy_new = new_K[0, 2], new_K[1, 2]
+                x_norm = (pt_undist[0] - cx_new) / fx_new
+                y_norm = (pt_undist[1] - cy_new) / fy_new
+                r2 = x_norm**2 + y_norm**2
+                r4 = r2**2
+                # D = [k1, k2, p1, p2] (4 coefficients)
+                k1, k2, p1, p2 = D[0], D[1], D[2], D[3]
+                radial = 1.0 + k1 * r2 + k2 * r4
+                x_dist = x_norm * radial + 2.0 * p1 * x_norm * y_norm + p2 * (r2 + 2.0 * x_norm**2)
+                y_dist = y_norm * radial + p1 * (r2 + 2.0 * y_norm**2) + 2.0 * p2 * x_norm * y_norm
+                # Project back with original K
+                px_orig = K[0, 0] * x_dist + K[0, 2]
+                py_orig = K[1, 1] * y_dist + K[1, 2]
+                # Polar coordinates relative to image center
+                dx = px_orig - img_center_full[0]
+                dy = py_orig - img_center_full[1]
+                radius = float(np.sqrt(dx**2 + dy**2))
+                angle = float(np.degrees(np.arctan2(dy, dx)))
+                entry["radius"] = round(radius, 1)
+                entry["angle"] = round(angle, 1)
+                entry["_pos_full"] = (float(px_orig), float(py_orig))
 
             # Annotate crop image with MTF scores
             crop_vis = cropped.copy()
@@ -551,6 +628,18 @@ def process_image(filename, output_dir, crops_dir, all_scores):
             cv2.imwrite(str(crop_path), crop_vis)
             print(f"  -> saved crop: {crop_path.name}")
 
+            # Draw blue crosses on detection visualization for each frequency row
+            for entry in freq_scores:
+                pos_full = entry.get("_pos_full")
+                if pos_full is not None:
+                    px_vis = int(pos_full[0] * vis_scale)
+                    py_vis = int(pos_full[1] * vis_scale)
+                    cross_size = 8
+                    cv2.line(vis, (px_vis - cross_size, py_vis), (px_vis + cross_size, py_vis),
+                             (255, 0, 0), 2, cv2.LINE_AA)
+                    cv2.line(vis, (px_vis, py_vis - cross_size), (px_vis, py_vis + cross_size),
+                             (255, 0, 0), 2, cv2.LINE_AA)
+
             for entry in freq_scores:
                 entry.pop("roi", None)
                 entry.pop("v_bar_roi", None)
@@ -559,6 +648,7 @@ def process_image(filename, output_dir, crops_dir, all_scores):
                 entry.pop("h_sample_roi", None)
                 entry.pop("v_crop_roi", None)
                 entry.pop("h_crop_roi", None)
+                entry.pop("_pos_full", None)
                 entry["image"] = filename.name
                 entry["target"] = target_name
                 all_scores.append(entry)
@@ -619,7 +709,7 @@ def main():
     # Write CSV
     if all_scores:
         csv_path = folder / "usaf_scores.csv"
-        fieldnames = ["image", "target", "frequency", "v_mtf", "h_mtf"]
+        fieldnames = ["image", "target", "frequency", "v_mtf", "h_mtf", "radius", "angle"]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
