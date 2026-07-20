@@ -300,6 +300,69 @@ def plot_poi_histogram(datasets, output_dir):
         print(f"Saved: {out_path}")
 
 
+def plot_target_resolution_count(datasets, output_dir):
+    """
+    Per-frequency bar chart: x-axis is number of images that resolve a target
+    (including 0), y-axis is number of targets with that count.
+    A target is resolved in an image at a given frequency if both H and V
+    lines score >= threshold.
+    """
+    all_freqs = set()
+    for df, _ in datasets:
+        all_freqs.update(df["frequency"].unique())
+    frequencies = sorted(all_freqs, reverse=True)
+
+    for freq in frequencies:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        for i, (df, label) in enumerate(datasets):
+            sub = df[df["frequency"] == freq].copy()
+            sub["resolved"] = (
+                sub["h_mtf"].notna()
+                & sub["v_mtf"].notna()
+                & (sub["h_mtf"] >= MTF_THRESHOLD)
+                & (sub["v_mtf"] >= MTF_THRESHOLD)
+            )
+
+            # For each unique target, count number of images that resolve it
+            resolve_counts = (
+                sub.groupby("target")["resolved"]
+                .sum()
+                .astype(int)
+            )
+
+            # Count how many targets have each resolve count (including 0)
+            max_count = resolve_counts.max() if len(resolve_counts) > 0 else 0
+            x_values = np.arange(0, max_count + 1)
+            y_values = [(resolve_counts == c).sum() for c in x_values]
+
+            color = COLORS[i % len(COLORS)]
+            offset = (i - (len(datasets) - 1) / 2) * (0.8 / len(datasets))
+            width = 0.8 / len(datasets)
+            bars = ax.bar(x_values + offset, y_values, width, color=color,
+                          edgecolor="black", label=label, alpha=0.85)
+            for bar, val in zip(bars, y_values):
+                if val > 0:
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.2,
+                        str(val),
+                        ha="center", va="bottom", fontsize=7,
+                    )
+
+        ax.set_xlabel("Number of images resolving the target")
+        ax.set_ylabel("Number of targets")
+        ax.set_title(f"Target resolution count — GSD {float(freq)/2:.2f} mm/pix (threshold = {MTF_THRESHOLD})")
+        ax.legend(fontsize=8)
+        ax.yaxis.get_major_locator().set_params(integer=True)
+
+        plt.tight_layout()
+        out_path = output_dir / f"target_resolution_count_gsd_{float(freq)/2:.2f}.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"Saved: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot USAF MTF score analysis (supports multiple CSVs)")
     parser.add_argument(
@@ -335,6 +398,7 @@ def main():
     plot_mtf_distributions(datasets, output_dir)
     plot_radius_histogram(datasets, output_dir)
     plot_poi_histogram(datasets, output_dir)
+    plot_target_resolution_count(datasets, output_dir)
 
     print("\nDone.")
 
