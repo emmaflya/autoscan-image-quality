@@ -21,22 +21,25 @@ from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 import os
 
-DPI = 300
+DPI = 600
 A4_WIDTH_MM = 210
 A4_HEIGHT_MM = 297
-MARGIN_MM = 10       # page margin
-GAP_MM = 8           # gap between the 4 target quadrants
+MARGIN_MM = 6        # page margin
+GAP_MM = 5           # gap between the 4 target quadrants
 
 APRILTAG_DICT = cv2.aruco.DICT_APRILTAG_36h11
 
-# Tag size as fraction of cell size (each target is a 3x3 grid of cells;
-# tags occupy the 4 corner cells, content is in the center cell area)
-TAG_SCALE = 0.70
+# Tag size in mm and inset from grid edge.
+# Tags are placed at the 4 corners of a square grid; the content area
+# occupies all space between the inner edges of the tags.
+TAG_SIZE_MM = 19
+TAG_INSET_MM = 1       # distance from grid edge to tag outer edge
+TAG_CONTENT_GAP_MM = 1 # gap between tag inner edge and content area
 
 # Line-pair frequencies in mm (period = one dark bar + one light gap).
 # Bar width = period / 2.
 # Ordered largest to smallest — drawn top to bottom in the target.
-FREQUENCIES_MM = [2.0, 1.0, 0.6]
+FREQUENCIES_MM = [2.0, 1.0, 0.6, 0.4, 0.3]
 
 # Internal margin inside each frequency element row (mm).
 # Keeps bars away from the row edges for cleaner profiles.
@@ -78,8 +81,8 @@ def main():
     gap = mm_to_px(GAP_MM)
     elem_margin = mm_to_px(ELEMENT_MARGIN_MM)
 
-    caption_font_size = mm_to_px(6)
-    caption_h = mm_to_px(10)
+    caption_font_size = mm_to_px(4)
+    caption_h = mm_to_px(6)
 
     usable_w = page_w - 2 * margin
     usable_h = page_h - 2 * margin - caption_h
@@ -88,16 +91,16 @@ def main():
     avail_h = (usable_h - (N_ROWS + 1) * gap) // N_ROWS
 
     grid_size = min(avail_w, avail_h)
-    cell_px = grid_size // 3
-    grid_size = cell_px * 3
 
-    tag_size_px = int(cell_px * TAG_SCALE)
+    tag_size_px = mm_to_px(TAG_SIZE_MM)
     if tag_size_px % 2 == 0:
         tag_size_px -= 1
+    tag_inset = mm_to_px(TAG_INSET_MM)
+    tag_content_gap = mm_to_px(TAG_CONTENT_GAP_MM)
 
-    content_offset = cell_px // 2 + tag_size_px // 2
-    content_end = 2 * cell_px + cell_px // 2 - tag_size_px // 2
-    content_size = content_end - content_offset
+    # Content area starts after the tag inner edge + gap, on each side
+    content_offset = tag_inset + tag_size_px + tag_content_gap
+    content_size = grid_size - 2 * content_offset
 
     total_grids_w = N_COLS * grid_size
     remaining_w = usable_w - total_grids_w
@@ -113,7 +116,14 @@ def main():
         font = ImageFont.load_default()
 
     dictionary = cv2.aruco.getPredefinedDictionary(APRILTAG_DICT)
-    tag_grid = [(0, 0), (2, 0), (2, 2), (0, 2)]
+    # Tag corner positions: (x_corner, y_corner) — TL, TR, BR, BL
+    # Each entry gives the grid-relative pixel position of the tag's top-left corner.
+    tag_corners = [
+        (tag_inset, tag_inset),                                          # TL
+        (grid_size - tag_inset - tag_size_px, tag_inset),                # TR
+        (grid_size - tag_inset - tag_size_px, grid_size - tag_inset - tag_size_px),  # BR
+        (tag_inset, grid_size - tag_inset - tag_size_px),                # BL
+    ]
 
     row_h = content_size // len(FREQUENCIES_MM)
 
@@ -162,14 +172,12 @@ def main():
             gx0 = margin + gap_w + col * (grid_size + gap_w)
             gy0 = area_top + gap_h + row * (grid_size + gap_h)
 
-            # Place 4 AprilTags
-            for tag_id, (gcol, grow) in zip(tag_ids, tag_grid):
+            # Place 4 AprilTags at corners
+            for tag_id, (tcx, tcy) in zip(tag_ids, tag_corners):
                 tag_marker = np.zeros((tag_size_px, tag_size_px), dtype=np.uint8)
                 cv2.aruco.generateImageMarker(dictionary, tag_id, tag_size_px, tag_marker, 1)
                 tag_img = Image.fromarray(tag_marker)
-                tx = gx0 + gcol * cell_px + (cell_px - tag_size_px) // 2
-                ty = gy0 + grow * cell_px + (cell_px - tag_size_px) // 2
-                img.paste(tag_img, (tx, ty))
+                img.paste(tag_img, (gx0 + tcx, gy0 + tcy))
 
             # Draw USAF frequency elements
             cx0 = gx0 + content_offset
@@ -227,10 +235,10 @@ def main():
     print()
     print(f"Total: {NUM_PAGES} pages, {len(all_targets)} targets, {next_tag_id} unique tag IDs")
     print(f"DPI: {DPI}")
-    print(f"Cell: {px_to_mm(cell_px):.1f}mm ({cell_px}px)")
+    print(f"Grid: {px_to_mm(grid_size):.1f}mm ({grid_size}px)")
     print(f"Tag side: {px_to_mm(tag_size_px):.1f}mm ({tag_size_px}px)")
     print(f"Content area: {px_to_mm(content_size):.1f}mm ({content_size}px)")
-    print(f"Bar widths: {', '.join(f'{f/2:.1f}mm' for f in FREQUENCIES_MM)}")
+    print(f"Bar widths: {', '.join(f'{f/2:.2f}mm' for f in FREQUENCIES_MM)}")
 
 
 if __name__ == "__main__":

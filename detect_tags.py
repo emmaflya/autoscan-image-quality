@@ -33,7 +33,7 @@ TARGETS_ID = {
 # spatial frequency names (top-to-bottom order). Detection of the
 # actual row positions is fully automatic from image content.
 
-FREQUENCY_LABELS = ["2.0", "1.0", "0.6"]
+FREQUENCY_LABELS = ["2.0", "1.0", "0.6", "0.4", "0.3"]
 
 
 # Longest dimension (px) for visualization output images (detection overlays).
@@ -56,6 +56,11 @@ CROP_OUTPUT_SIZE = 800
 # Expressed as a fraction of the detected tag side length.
 # e.g. 0.7 = trim 0.7 × tag_side from each edge inward.
 CROP_INSET_FRACTION = 0.55
+
+# Horizontal split between H-bars (left) and V-bars (right) in the cropped image.
+# Expressed as a fraction of crop width to shift rightward from center.
+# 0.0 = exact center, positive = shift right (gives more space to H-bars).
+COL_SPLIT_OFFSET = 0.05
 
 
 # Minimum MTF below which bars are considered unresolved.
@@ -187,10 +192,10 @@ def score_usaf(cropped_img):
     Score each USAF frequency element in the cropped image.
 
     Layout assumption (fixed):
-      - The cropped square is divided into 2 columns × 3 rows = 6 cells
+      - The cropped square is divided into 2 columns × N rows (one per frequency)
       - Left column: horizontal bars (profile along y)
       - Right column: vertical bars (profile along x)
-      - Rows top-to-bottom: low freq, mid freq, high freq
+      - Rows top-to-bottom: largest to smallest period
         (matching FREQUENCY_LABELS order)
 
     For each cell:
@@ -205,7 +210,7 @@ def score_usaf(cropped_img):
 
     num_rows = len(FREQUENCY_LABELS)
     row_h = h // num_rows
-    col_w = w // 2
+    col_w = w // 2 + int(w * COL_SPLIT_OFFSET)
 
     results = []
 
@@ -576,9 +581,9 @@ def process_image(filename, output_dir, crops_dir, all_scores):
             if len(crop_vis.shape) == 2:
                 crop_vis = cv2.cvtColor(crop_vis, cv2.COLOR_GRAY2BGR)
             ch, cw = crop_vis.shape[:2]
-            col_w = cw // 2
+            col_w = cw // 2 + int(cw * COL_SPLIT_OFFSET)
 
-            # Draw grid lines (2 cols × 3 rows)
+            # Draw grid lines (2 cols × N rows)
             num_rows = len(FREQUENCY_LABELS)
             row_h_vis = ch // num_rows
             # Vertical split
